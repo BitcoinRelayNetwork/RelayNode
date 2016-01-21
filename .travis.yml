@@ -1,0 +1,16 @@
+sudo: required
+dist: trusty
+os: linux
+language: cpp
+compiler: gcc
+addons:
+  apt:
+    packages:
+      - yasm
+      - binutils-mingw-w64-i686
+      - gcc-mingw-w64-i686
+      - g++-mingw-w64-i686
+      - build-essential
+script:
+  - cd c++
+  - make all-targets
