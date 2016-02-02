@@ -19,3 +19,4 @@ c++/rpcclient.o
 c++/server.o
 c++/test.o
 c++/utils.o
+.idea
