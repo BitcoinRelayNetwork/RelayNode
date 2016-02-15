@@ -2,7 +2,6 @@
 #define _RELAY_CONNECTION_H
 
 #include <string>
-#include <atomic>
 #include <condition_variable>
 #include <thread>
 #include <list>
@@ -12,22 +11,21 @@
 
 #include "utils.h"
 
-enum DisconnectFlags {
-	DISCONNECT_STARTED = 1,
-	DISCONNECT_PRINT_AND_CLOSE = 2,
-	DISCONNECT_READS_DONE = 4,
-	DISCONNECT_GLOBAL_THREAD_DONE = 8,
-	DISCONNECT_COMPLETE = 16,
-};
+#ifdef SLOW_TEST
+#define CONNECTION_MAX_READ_BYTES 1
+#elif defined(FOR_TEST)
+#define CONNECTION_MAX_READ_BYTES (sizeof(struct relay_msg_header) - 2)
+#else
+#define CONNECTION_MAX_READ_BYTES 65536
+#endif
+
 
 class Connection {
 private:
 	const int sock;
-	std::mutex send_mutex, send_bytes_mutex;
+
 	int outside_send_mutex_token;
-
-	std::function<void(void)> on_disconnect;
-
+	std::mutex send_mutex, send_bytes_mutex;
 	std::list<std::shared_ptr<std::vector<unsigned char> > > outbound_primary_queue, outbound_secondary_queue;
 	size_t primary_writepos, secondary_writepos;
 
@@ -36,54 +34,45 @@ private:
 	//
 	// initial_outbound_bytes is defined as the quantity of bytes sent with send_mutex_token
 	// (not mabye_send, do_send), during initial_outbound_throttle
-	std::atomic_bool initial_outbound_throttle;
+	DECLARE_ATOMIC(bool, initial_outbound_throttle);
 	std::atomic_flag initial_outbound_throttle_done;
 	int64_t initial_outbound_bytes;
-	std::atomic<int64_t> total_waiting_size;
+	DECLARE_ATOMIC_INT(int64_t, total_waiting_size);
 	std::chrono::steady_clock::time_point earliest_next_write;
 	uint32_t max_outbound_buffer_size;
 
-	std::mutex read_mutex;
-	std::condition_variable read_cv;
-	size_t readpos;
-	std::atomic<int64_t> total_inbound_size;
-	std::list<std::unique_ptr<std::vector<unsigned char> > > inbound_queue;
+	bool on_connect_called;
 
-	std::thread *user_thread;
-	int sock_errno;
+protected:
+	enum DisconnectFlags {
+		// Used by Connection:
+		DISCONNECT_PRINT_AND_CLOSE = 1,
+		DISCONNECT_SOCK_DOWN = 2,
+		DISCONNECT_GLOBAL_WRITE_THREAD_DONE = 4,
+		DISCONNECT_GLOBAL_READ_THREAD_DONE = 8,
+		DISCONNECT_GLOBAL_THREADS_DONE = DISCONNECT_GLOBAL_WRITE_THREAD_DONE | DISCONNECT_GLOBAL_READ_THREAD_DONE,
+		// Used by ThreadedConnection:
+		DISCONNECT_STARTED = 16,
+		DISCONNECT_THREADS_CLOSED = 32,
+	};
+	DECLARE_ATOMIC_INT(int, disconnectFlags);
+private:
+	DECLARE_ATOMIC_INT(int, sock_errno);
 
-	std::atomic<int> disconnectFlags;
 public:
 	const std::string host;
 
-	Connection(int sockIn, std::string hostIn, std::function<void(void)> on_disconnect_in, uint32_t max_outbound_buffer_size_in=10000000) :
-			sock(sockIn), outside_send_mutex_token(0xdeadbeef * (unsigned long)this), on_disconnect(on_disconnect_in),
-			primary_writepos(0), secondary_writepos(0), initial_outbound_throttle(false), initial_outbound_throttle_done(false),
+	Connection(int sockIn, std::string hostIn, uint32_t max_outbound_buffer_size_in=10000000) : sock(sockIn),
+			outside_send_mutex_token(0xdeadbeef * (unsigned long)this), primary_writepos(0), secondary_writepos(0),
+			initial_outbound_throttle(false), initial_outbound_throttle_done(false),
 			initial_outbound_bytes(0), total_waiting_size(0), earliest_next_write(std::chrono::steady_clock::time_point::min()),
-			max_outbound_buffer_size(max_outbound_buffer_size_in), readpos(0), total_inbound_size(0), sock_errno(0),
-			disconnectFlags(0), host(hostIn)
+			max_outbound_buffer_size(max_outbound_buffer_size_in), on_connect_called(false), disconnectFlags(0), sock_errno(0), host(hostIn)
 		{}
 
-protected:
-	void construction_done() {
-		user_thread = new std::thread(do_setup_and_read, this);
-	}
-
-public:
 	virtual ~Connection();
 
-	int getDisconnectFlags() { return disconnectFlags; }
-
 protected:
-	virtual void net_process(const std::function<void(std::string)>& disconnect)=0;
-	ssize_t read_all(char *buf, size_t nbyte, millis_lu_type max_sleep = millis_lu_type::max()); // Only allowed from within net_process
-
-	void do_send_bytes(const char *buf, size_t nbyte, int send_mutex_token=0) {
-		do_send_bytes(std::make_shared<std::vector<unsigned char> >((unsigned char*)buf, (unsigned char*)buf + nbyte), send_mutex_token);
-	}
-
-	void do_send_bytes(const std::shared_ptr<std::vector<unsigned char> >& bytes, int send_mutex_token=0);
-	void maybe_send_bytes(const std::shared_ptr<std::vector<unsigned char> >& bytes, int send_mutex_token=0);
+	void construction_done();
 
 public:
 	// See the comment above initial_outbound_throttle for special meanings of the send_mutex_tokens
@@ -91,39 +80,73 @@ public:
 	void release_send_mutex(int send_mutex_token);
 	void do_throttle_outbound() { if (!initial_outbound_throttle_done.test_and_set()) initial_outbound_throttle = true; }
 
-	void disconnect_from_outside(const char* reason);
+	void disconnect(const char* reason);
+	virtual bool disconnectComplete();
+	bool disconnectStarted() { return disconnectFlags != 0; }
+	std::string getDisconnectDebug() {
+		int flags = disconnectFlags;
+		std::string res("0");
+		if (flags & DISCONNECT_PRINT_AND_CLOSE) res += "|PRINT_AND_CLOSE";
+		if (flags & DISCONNECT_SOCK_DOWN) res += "|SOCK_DOWN";
+		if (flags & DISCONNECT_GLOBAL_WRITE_THREAD_DONE) res += "|GLOBAL_WRITE_THREAD_DONE";
+		if (flags & DISCONNECT_GLOBAL_READ_THREAD_DONE) res += "|GLOBAL_READ_THREAD_DONE";
+		if (flags & DISCONNECT_STARTED) res += "|STARTED";
+		if (flags & DISCONNECT_THREADS_CLOSED) res += "|THREADS_CLOSED";
+		return res;
+	}
+
+protected:
+	void do_send_bytes(const char *buf, size_t nbyte, int send_mutex_token=0) {
+		do_send_bytes(std::make_shared<std::vector<unsigned char> >((unsigned char*)buf, (unsigned char*)buf + nbyte), send_mutex_token);
+	}
+
+	void do_send_bytes(const std::shared_ptr<std::vector<unsigned char> >& bytes, int send_mutex_token=0);
+	void maybe_send_bytes(const std::shared_ptr<std::vector<unsigned char> >& bytes, int send_mutex_token=0);
+
+	// recv_bytes will only ever be called in a thread-safe manner, however it may be called, at different times, from different threads
+	virtual void recv_bytes(char* buf, size_t len)=0;
+	// readable must run unlocked
+	virtual bool readable()=0;
+	// after readable() changes from false to true, you must call notify_readable_change()
+	// calls to notify_readable_change() when readable() has not changed are allowed
+	void notify_readable_change();
+	// on_disconnect_done is called just after setting DISCONNECT_GLOBAL_THREADS_DONE
+	virtual void on_disconnect_done() {}
+	// on_connect_done is called before any recv_bytes, just after socket bringup
+	// Note that on_disconnect_done may be called without any call to on_connect_done
+	virtual void on_connect_done() {}
 
 private:
-	void disconnect(std::string reason);
-	static void do_setup_and_read(Connection* me);
-
 	friend class GlobalNetProcess;
 };
 
 class OutboundPersistentConnection {
 private:
-	std::atomic_int mutex_valid;
+	DECLARE_ATOMIC_INT(int, mutex_valid);
 	uint32_t max_outbound_buffer_size;
 
 	class OutboundConnection : public Connection {
 	private:
 		OutboundPersistentConnection *parent;
-		void net_process(const std::function<void(std::string)>& disconnect) { parent->on_connect_keepalive(); parent->net_process(disconnect); }
+		void on_connect_done() { parent->on_connect(); parent->on_connect_keepalive(); }
+		void on_disconnect_done() { parent->reconnect("THIS SHOULD NEVER PRINT"); }
 
 	public:
 		OutboundConnection(int sockIn, OutboundPersistentConnection* parentIn) :
-				Connection(sockIn, parentIn->serverHost, [&](void) { parent->reconnect("THIS SHOULD NEVER PRINT"); }, parentIn->max_outbound_buffer_size),
+				Connection(sockIn, parentIn->serverHost + ":" + std::to_string(parentIn->serverPort), parentIn->max_outbound_buffer_size),
 				parent(parentIn)
 			{ }
 
-		ssize_t read_all(char *buf, size_t nbyte, millis_lu_type max_sleep) { return Connection::read_all(buf, nbyte, max_sleep); }
 		void do_send_bytes(const char *buf, size_t nbyte, int send_mutex_token) { return Connection::do_send_bytes(buf, nbyte, send_mutex_token); }
 		void do_send_bytes(const std::shared_ptr<std::vector<unsigned char> >& bytes, int send_mutex_token) { return Connection::do_send_bytes(bytes, send_mutex_token); }
 		void construction_done() { Connection::construction_done(); }
+		void notify_readable_change() { Connection::notify_readable_change(); }
+		void recv_bytes(char* buf, size_t len) { parent->recv_bytes(buf, len); }
+		bool readable() { return parent->readable(); }
 	};
 
-	std::atomic<unsigned long> connection;
-	static_assert(sizeof(unsigned long) == sizeof(OutboundConnection*), "unsigned long must be the size of a pointer");
+	ReadWriteMutex connection_mutex;
+	OutboundConnection* connection;
 
 public:
 	const std::string serverHost;
@@ -136,41 +159,54 @@ public:
 	int get_send_mutex();
 	void release_send_mutex(int token);
 	void do_throttle_outbound(int token) {
-		OutboundConnection* conn = (OutboundConnection*)connection.load();
-		if (conn && mutex_valid == token)
-			conn->do_throttle_outbound();
+		ReadWriteMutexReader read(&connection_mutex);
+		std::lock_guard<ReadWriteMutexReader> lock(read);
+		if (connection && mutex_valid == token)
+			connection->do_throttle_outbound();
 	}
 
-	void disconnect_from_outside(const char* reason) {
-		OutboundConnection* conn = (OutboundConnection*)connection.load();
-		if (conn)
-			conn->disconnect_from_outside(reason);
+	void disconnect(const char* reason) {
+		ReadWriteMutexReader read(&connection_mutex);
+		std::lock_guard<ReadWriteMutexReader> lock(read);
+		if (connection)
+			connection->disconnect(reason);
 	}
 
 protected:
 	void construction_done() { std::thread(do_connect, this).detach(); }
 
+	// Note that on_disconnect may be called without any call to on_connect
+	virtual void on_connect()=0;
 	virtual void on_disconnect()=0;
-	virtual void net_process(const std::function<void(std::string)>& disconnect)=0;
-	ssize_t read_all(char *buf, size_t nbyte, millis_lu_type max_sleep = millis_lu_type::max()) { return ((OutboundConnection*)connection.load())->read_all(buf, nbyte, max_sleep); } // Only allowed from within net_process
+	virtual void recv_bytes(char* buf, size_t len)=0;
+	virtual bool readable()=0;
+
+	void notify_readable_change() {
+		ReadWriteMutexReader read(&connection_mutex);
+		std::lock_guard<ReadWriteMutexReader> lock(read);
+		if (connection)
+			connection->notify_readable_change();
+	}
 
 	void maybe_do_send_bytes(const char *buf, size_t nbyte, int send_mutex_token=0) {
-		OutboundConnection* conn = (OutboundConnection*)connection.load();
-		if (conn) {
+		ReadWriteMutexReader read(&connection_mutex);
+		std::lock_guard<ReadWriteMutexReader> lock(read);
+		if (connection) {
 			assert(!mutex_valid || send_mutex_token == mutex_valid);
-			conn->do_send_bytes(buf, nbyte, mutex_valid == send_mutex_token ? send_mutex_token : 0);
+			connection->do_send_bytes(buf, nbyte, mutex_valid == send_mutex_token ? send_mutex_token : 0);
 		}
 	}
 	void maybe_do_send_bytes(const std::shared_ptr<std::vector<unsigned char> >& bytes, int send_mutex_token=0) {
-		OutboundConnection* conn = (OutboundConnection*)connection.load();
-		if (conn) {
+		ReadWriteMutexReader read(&connection_mutex);
+		std::lock_guard<ReadWriteMutexReader> lock(read);
+		if (connection) {
 			assert(!mutex_valid || send_mutex_token == mutex_valid);
-			conn->do_send_bytes(bytes, mutex_valid == send_mutex_token ? send_mutex_token : 0);
+			connection->do_send_bytes(bytes, mutex_valid == send_mutex_token ? send_mutex_token : 0);
 		}
 	}
 
 private:
-	void reconnect(std::string disconnectReason); // Called only after DISCONNECT_COMPLETE in Connection, or before Connection::construction_done()
+	void reconnect(std::string disconnectReason); // Called only after DISCONNECT_COMPLETE in ThreadedConnection, or before ThreadedConnection::construction_done()
 	static void do_connect(OutboundPersistentConnection* me);
 
 	virtual void on_disconnect_keepalive() {}

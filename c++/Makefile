@@ -1,5 +1,5 @@
 # all common objects that need to be build for all targets except for windows version
-common_objs := flaggedarrayset.o utils.o relayprocess.o p2pclient.o connection.o ./crypto/sha2.o
+common_objs := flaggedarrayset.o utils.o relayprocess.o p2pclient.o connection.o relayconnection.o ./crypto/sha2.o
 native_objs :=
 
 MINGW_PREFIX := i686-w64-mingw32
@@ -29,9 +29,15 @@ endif
 
 variant ?= production
 ifneq (,$(findstring test,$(variant)))
-  COMMON_CXXFLAGS += -DFOR_TEST -DTEST_DATA
-  ifeq ($(variant),fasttest)
-    COMMON_CXXFLAGS += -O3
+  ifeq ($(variant),drdtest)
+    NATIVE_CXXFLAGS += -DFOR_VALGRIND
+  else
+    COMMON_CXXFLAGS += -DFOR_TEST -DTEST_DATA
+    ifeq ($(variant),fasttest)
+      COMMON_CXXFLAGS += -O3
+    else
+      COMMON_CXXFLAGS += -DSLOW_TEST
+    endif
   endif
 else
   ifeq ($(variant),bench)
@@ -85,11 +91,11 @@ endif
 
 COMMON_CXXFLAGS += -std=c++11 -Wall
 
-CXXFLAGS += $(COMMON_CXXFLAGS) $(NATIVE_CXXFLAGS)
-LDFLAGS += -pthread -lresolv
+CXXFLAGS += $(COMMON_CXXFLAGS) $(NATIVE_CXXFLAGS) $(CUSTOM_CXXFLAGS)
+LDFLAGS += -pthread -lresolv $(CUSTOM_LDFLAGS)
 
 # list of all targets
-NATIVE_TARGETS = $(addprefix relaynetwork,client terminator proxy outbound server mempoolserver test)
+NATIVE_TARGETS = $(addprefix relaynetwork,client proxy server mempoolserver test nettest)
 WINDOWS_TARGETS = relaynetworkclient.exe
 
 %.a: %.asm
@@ -110,13 +116,11 @@ relaynetworkserver: $(native_objs) $(common_objs) server.o
 
 relaynetworkmempoolserver: $(native_objs) $(common_objs) rpcclient.o mempoolserver.o
 
-relaynetworkterminator: $(native_objs) $(common_objs) bitcoindterminator.o
-
 relaynetworkproxy: $(native_objs) $(common_objs) relayproxy.o
 
-relaynetworkoutbound: $(native_objs) $(common_objs) p2poutbound.o
-
 relaynetworktest: $(native_objs) $(common_objs) test.o
+
+relaynetworknettest: $(native_objs) $(common_objs) net_test.o
 
 relaynetwork%:
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
@@ -127,3 +131,6 @@ install: relaynetworkclient relaynetworkclient.exe
 
 clean:
 	rm -f *.o crypto/*.o crypto/sha256_code_release/*.a crypto/*~ *~ *.exe $(NATIVE_TARGETS) $(WINDOWS_TARGETS)
+
+check: relaynetworktest relaynetworknettest
+	./relaynetworknettest && ./relaynetworktest

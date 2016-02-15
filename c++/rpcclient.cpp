@@ -1,3 +1,4 @@
+#include "preinclude.h"
 #include "rpcclient.h"
 
 #include <sstream>
@@ -11,6 +12,77 @@
 void RPCClient::on_disconnect() {
 	connected = false;
 	awaiting_response = false;
+	std::lock_guard<std::mutex> lock(read_mutex);
+	read_cv.notify_all();
+}
+
+void RPCClient::on_connect() {
+	connected = true;
+	read_thread = new std::thread([&]() { this->net_process(); });
+}
+
+void RPCClient::disconnect(const char* reason) {
+	assert(std::this_thread::get_id() == ((std::thread*)read_thread)->get_id());
+	std::thread([&]() {
+		((std::thread*)read_thread)->join();
+		delete read_thread;
+		OutboundPersistentConnection::disconnect(reason);
+	}).detach();
+}
+
+bool RPCClient::readable() {
+	return total_inbound_size < sizeof(inbound_queue) - CONNECTION_MAX_READ_BYTES;
+}
+
+void RPCClient::recv_bytes(char* buf, size_t len) {
+	assert(readable());
+	assert(len <= CONNECTION_MAX_READ_BYTES);
+	std::lock_guard<std::mutex> lock(read_mutex);
+
+	size_t writepos = (readpos + total_inbound_size) % sizeof(inbound_queue);
+	size_t writelen = std::min(len, sizeof(inbound_queue) - writepos);
+	memcpy(inbound_queue + readpos, buf, writelen);
+
+	if (writelen < len) {
+		assert((writepos + writelen) % sizeof(inbound_queue) == 0);
+		assert(len - writelen <= readpos);
+		memcpy(inbound_queue, buf + writelen, len - writelen);
+	}
+	total_inbound_size += len;
+
+	read_cv.notify_all();
+}
+
+ssize_t RPCClient::read_all(char *buf, size_t nbyte, millis_lu_type max_sleep) {
+	size_t total = 0;
+	std::chrono::system_clock::time_point stop_time;
+	if (max_sleep == millis_lu_type::max())
+		stop_time = std::chrono::system_clock::time_point::max();
+	else
+		stop_time = std::chrono::system_clock::now() + max_sleep;
+	while (total < nbyte) {
+		std::unique_lock<std::mutex> lock(read_mutex);
+		while (connected && !total_inbound_size && std::chrono::system_clock::now() < stop_time)
+			read_cv.wait_until(lock, stop_time);
+
+		if (std::chrono::system_clock::now() >= stop_time)
+			return total;
+
+		if (!connected)
+			return -1;
+
+		size_t readamt = std::min({size_t(nbyte - total), size_t(total_inbound_size), size_t(sizeof(inbound_queue) - readpos)});
+		memcpy(buf + total, inbound_queue + readpos, readamt);
+		readpos = (readpos + readamt) % sizeof(inbound_queue);
+		total += readamt;
+
+		bool was_readable = readable();
+		total_inbound_size -= readamt;
+		if (!was_readable && readable())
+			notify_readable_change();
+	}
+	assert(total == nbyte);
+	return nbyte;
 }
 
 struct CTxMemPoolEntry {
@@ -25,9 +97,7 @@ struct CTxMemPoolEntry {
 	}
 };
 
-void RPCClient::net_process(const std::function<void(std::string)>& disconnect) {
-	connected = true;
-
+void RPCClient::net_process() {
 	uint8_t count = 0;
 	while (true) {
 		int content_length = -2;
@@ -112,7 +182,7 @@ void RPCClient::net_process(const std::function<void(std::string)>& disconnect) 
 		// These are values/flags about the current status of the parser
 		int32_t stringStart = -1, fieldValueStart = -1;
 		std::string txHash, fieldString;
-		long tx_size = -1; uint64_t tx_fee = -1; double tx_prio = -1;
+		long tx_size = -1; int64_t tx_fee = -1; double tx_prio = -1;
 		bool inTx = false, inFieldString = false, inFieldValue = false;
 		std::unordered_set<std::string> txDeps;
 
@@ -156,7 +226,7 @@ void RPCClient::net_process(const std::function<void(std::string)>& disconnect) 
 						}
 					} else if (fieldString == "fee") {
 						try {
-							tx_fee = uint64_t(std::stod(std::string(resp.begin() + fieldValueStart, it)) * 100000000);
+							tx_fee = int64_t(std::stod(std::string(resp.begin() + fieldValueStart, it)) * 100000000);
 						} catch (std::exception& e) {
 							return disconnect("transaction value could not be parsed");
 						}
@@ -209,7 +279,7 @@ void RPCClient::net_process(const std::function<void(std::string)>& disconnect) 
 							}
 						} else if (fieldString == "fee") {
 							try {
-								tx_fee = uint64_t(std::stod(std::string(resp.begin() + fieldValueStart, it)) * 100000000);
+								tx_fee = int64_t(std::stod(std::string(resp.begin() + fieldValueStart, it)) * 100000000);
 							} catch (std::exception& e) {
 								return disconnect("transaction value could not be parsed");
 							}

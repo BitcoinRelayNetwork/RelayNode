@@ -15,10 +15,10 @@
 struct ElemAndFlag {
 	uint32_t flag;
 	std::shared_ptr<std::vector<unsigned char> > elem, elemHash;
-	std::vector<unsigned char>::const_iterator elemBegin, elemEnd;
+	const unsigned char *elemBegin, *elemEnd;
 	ElemAndFlag(const std::shared_ptr<std::vector<unsigned char> >& elemIn, uint32_t flagIn, bool setHash);
 	ElemAndFlag(const std::shared_ptr<std::vector<unsigned char> >& elemHashIn, std::nullptr_t);
-	ElemAndFlag(const std::vector<unsigned char>::const_iterator& elemBegin, const std::vector<unsigned char>::const_iterator& elemEnd, uint32_t flagIn);
+	ElemAndFlag(const unsigned char* elemBegin, const unsigned char* elemEnd, uint32_t flagIn);
 	bool operator == (const ElemAndFlag& o) const;
 };
 namespace std {
@@ -46,38 +46,35 @@ private:
 	mutable uint32_t max_remove;
 	mutable uint64_t flags_to_remove;
 
+	mutable std::vector<int> unsorted_to_remove;
+
+	void _clear(bool takeLock);
+
 public:
-	void clear();
+	void clear() { _clear(true); }
 	FlaggedArraySet(uint64_t maxSizeIn, uint64_t maxFlagCountIn);
 	~FlaggedArraySet();
 
-	size_t size() const { return backingMap.size() - to_be_removed.size(); }
-	uint64_t flagCount() const { return flag_count - flags_to_remove; }
+	size_t size() const { return backingMap.size() - to_be_removed.size() - unsorted_to_remove.size(); }
+	uint64_t flagCount() const;
 	bool contains(const std::shared_ptr<std::vector<unsigned char> >& e) const;
 	bool contains(const unsigned char* elemHash) const;
 
-	FlaggedArraySet& operator=(const FlaggedArraySet& o) {
-		o.cleanup_late_remove();
-		clear();
-
-		maxSize = o.maxSize;
-		maxFlagCount = o.maxFlagCount;
-		flag_count = o.flag_count;
-		offset = o.offset;
-		backingMap = o.backingMap;
-		indexMap = o.indexMap;
-		return *this;
-	}
+	FlaggedArraySet& operator=(const FlaggedArraySet& o);
 
 private:
 	bool sanity_check() const;
 	void remove_(size_t index);
-	void cleanup_late_remove() const;
+	void cleanup_late_remove(bool allowSortedToRemain) const;
 
 public:
 	void add(const std::shared_ptr<std::vector<unsigned char> >& e, uint32_t flag);
-	int remove(const std::vector<unsigned char>::const_iterator& start, const std::vector<unsigned char>::const_iterator& end);
-	bool remove(unsigned int index, std::vector<unsigned char>& elemRes, unsigned char* elemHashRes);
+	int remove(const unsigned char* start, const unsigned char* end);
+	std::shared_ptr<std::vector<unsigned char> > remove(unsigned int index, unsigned char* elemHashRes);
+
+	int get_index(const unsigned char* start, const unsigned char* end) const;
+	std::shared_ptr<std::vector<unsigned char> > get_at_index(unsigned int index, unsigned char* elemHashRes) const;
+	void remove_indexes(std::vector<int>& indexes);
 
 	void for_all_txn(const std::function<void (const std::shared_ptr<std::vector<unsigned char> >&)> callback) const;
 };

@@ -1,12 +1,15 @@
 #ifndef _RELAY_UTILS_H
 #define _RELAY_UTILS_H
 
+#include "preinclude.h"
+
 #include <vector>
 #include <string>
 #include <assert.h>
 #include <unistd.h>
-#include <mutex>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <sys/time.h>
 
 #define likely(x)   __builtin_expect((x), 1)
@@ -59,9 +62,10 @@
 struct relay_msg_header {
 	uint32_t magic, type, length;
 };
+static_assert(sizeof(struct relay_msg_header) == 3*4, "relay_msg_header is 12 bytes");
 
 #define RELAY_MAGIC_BYTES htonl(0xF2BEEF42)
-#define VERSION_STRING "spammy memeater"
+#define VERSION_STRING "what i should have done"
 #define MAX_RELAY_TRANSACTION_BYTES 100000
 #define MAX_FAS_TOTAL_SIZE 5000000
 
@@ -73,6 +77,8 @@ struct relay_msg_header {
 // Limit outbound to avg 2Mbps worst-case (2Mb / 1000 ms)
 #define OUTBOUND_THROTTLE_BYTES_PER_MS 250
 
+// Number of types of compressors there are (see server)
+#define COMPRESSOR_TYPES 3
 
 
 #define BITCOIN_MAGIC htonl(0xf9beb4d9)
@@ -131,6 +137,7 @@ inline void move_forward(std::vector<unsigned char>::const_iterator& it, size_t 
 	std::advance(it, i);
 }
 uint64_t read_varint(std::vector<unsigned char>::const_iterator& it, const std::vector<unsigned char>::const_iterator& end);
+uint32_t varint_length(uint32_t num);
 std::vector<unsigned char> varint(uint32_t size);
 
 /***********************
@@ -150,6 +157,7 @@ int create_connect_socket(const std::string& serverHost, const uint16_t serverPo
 void double_sha256(const unsigned char* input, unsigned char* res, uint64_t byte_count);
 void double_sha256_two_32_inputs(const unsigned char* input, const unsigned char* input2, unsigned char* res);
 void getblockhash(std::vector<unsigned char>& hashRes, const std::vector<unsigned char>& block, size_t offset);
+void getblockhash(std::vector<unsigned char>& hashRes, const unsigned char* headerptr);
 
 void double_sha256_init(uint32_t state[8]);
 void double_sha256_step(const unsigned char* input, uint64_t byte_count, uint32_t state[8]);
@@ -159,10 +167,13 @@ void double_sha256_done(const unsigned char* input, uint64_t byte_count, uint64_
  *** Random stuff ***
  ********************/
 #define HASH_FORMAT "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x"
-#define HASH_PRINT(var) (var)[31], (var)[30], \
-						(var)[29], (var)[28], (var)[27], (var)[26], (var)[25], (var)[24], (var)[23], (var)[22], (var)[21], (var)[20], \
-						(var)[19], (var)[18], (var)[17], (var)[16], (var)[15], (var)[14], (var)[13], (var)[12], (var)[11], (var)[10], \
-						(var)[ 9], (var)[ 8], (var)[ 7], (var)[ 6], (var)[ 5], (var)[ 4], (var)[ 3], (var)[ 2], (var)[ 1], (var)[ 0]
+#define HASH_PRINT(var) (unsigned char)(var)[31], (unsigned char)(var)[30], \
+						(unsigned char)(var)[29], (unsigned char)(var)[28], (unsigned char)(var)[27], (unsigned char)(var)[26], (unsigned char)(var)[25], \
+						(unsigned char)(var)[24], (unsigned char)(var)[23], (unsigned char)(var)[22], (unsigned char)(var)[21], (unsigned char)(var)[20], \
+						(unsigned char)(var)[19], (unsigned char)(var)[18], (unsigned char)(var)[17], (unsigned char)(var)[16], (unsigned char)(var)[15], \
+						(unsigned char)(var)[14], (unsigned char)(var)[13], (unsigned char)(var)[12], (unsigned char)(var)[11], (unsigned char)(var)[10], \
+						(unsigned char)(var)[ 9], (unsigned char)(var)[ 8], (unsigned char)(var)[ 7], (unsigned char)(var)[ 6], (unsigned char)(var)[ 5], \
+						(unsigned char)(var)[ 4], (unsigned char)(var)[ 3], (unsigned char)(var)[ 2], (unsigned char)(var)[ 1], (unsigned char)(var)[ 0]
 bool hex_str_to_reverse_vector(const std::string& str, std::vector<unsigned char>& vec);
 std::string asciifyString(const std::string& str);
 
@@ -202,7 +213,7 @@ void do_assert(bool flag, const char* file, unsigned long line);
 class WaitCountMutex {
 private:
 	std::mutex mutex;
-	std::atomic_int waitCount;
+	DECLARE_ATOMIC_INT(int, waitCount);
 
 	friend class WaitCountHint;
 public:
@@ -227,6 +238,60 @@ public:
 		: mutex(&mutexIn)
 		{ mutex->waitCount.fetch_add(1, std::memory_order_release); }
 	~WaitCountHint() { mutex->waitCount.fetch_sub(1, std::memory_order_relaxed); }
+};
+
+/*****************************************
+ *** A R-W Mutex (no upgrades for now) ***
+ *****************************************/
+class ReadWriteMutex {
+private:
+	std::mutex mutex;
+	std::condition_variable write_done_cv, read_done_cv;
+	int readers = 0;
+	bool writer_waiting = false;
+public:
+	void read_lock() {
+		std::unique_lock<std::mutex> lock(mutex);
+		while (writer_waiting)
+			write_done_cv.wait(lock);
+		readers++;
+	}
+	void read_unlock() {
+		std::lock_guard<std::mutex> lock(mutex);
+		readers--;
+		read_done_cv.notify_all();
+	}
+
+	void write_lock() {
+		std::unique_lock<std::mutex> lock(mutex);
+		writer_waiting = true;
+		while (readers)
+			read_done_cv.wait(lock);
+		writer_waiting = false;
+		lock.release();
+	}
+	void write_unlock() {
+		write_done_cv.notify_all();
+		mutex.unlock();
+	}
+};
+
+class ReadWriteMutexReader {
+private:
+	ReadWriteMutex* mutex;
+public:
+	ReadWriteMutexReader(ReadWriteMutex* mutex_in) : mutex(mutex_in) {}
+	void lock() { mutex->read_lock(); }
+	void unlock() { mutex->read_unlock(); }
+};
+
+class ReadWriteMutexWriter {
+private:
+	ReadWriteMutex* mutex;
+public:
+	ReadWriteMutexWriter(ReadWriteMutex* mutex_in) : mutex(mutex_in) {}
+	void lock() { mutex->write_lock(); }
+	void unlock() { mutex->write_unlock(); }
 };
 
 #endif

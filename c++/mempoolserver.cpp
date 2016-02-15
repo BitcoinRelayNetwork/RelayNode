@@ -1,3 +1,5 @@
+#include "preinclude.h"
+
 #include <map>
 #include <vector>
 #include <thread>
@@ -20,7 +22,7 @@
 
 class MempoolClient : public Connection {
 public:
-	MempoolClient(int fd_in, std::string hostIn) : Connection(fd_in, hostIn, NULL) { construction_done(); }
+	MempoolClient(int fd_in, std::string hostIn) : Connection(fd_in, hostIn) { construction_done(); }
 	void send_pool(std::set<std::vector<unsigned char> >::const_iterator mempool_begin, const std::set<std::vector<unsigned char> >::const_iterator mempool_end, int send_mutex=0) {
 		while (mempool_begin != mempool_end) {
 			assert(mempool_begin->size() == 32);
@@ -29,14 +31,8 @@ public:
 		}
 	}
 private:
-	void net_process(const std::function<void(std::string)>& disconnect) {
-		char buf[42];
-		while (true) {
-			ssize_t res = read_all(buf, 42);
-			if (res != 42)
-				return disconnect("Socket error reading bytes from mempool client");
-		}
-	}
+	bool readable() { return true; }
+	void recv_bytes(char* buf, size_t len) {}
 };
 
 int main(int argc, char** argv) {
@@ -108,7 +104,7 @@ int main(int argc, char** argv) {
 
 						std::lock_guard<std::mutex> lock(map_mutex);
 						for (auto it = clientMap.begin(); it != clientMap.end(); it++) {
-							if (!it->second->getDisconnectFlags())
+							if (!it->second->disconnectStarted())
 								it->second->send_pool(new_txn.begin(), new_txn.end());
 						}
 					});
@@ -119,7 +115,7 @@ int main(int argc, char** argv) {
 			{
 				std::lock_guard<std::mutex> lock(map_mutex);
 				for (auto it = clientMap.begin(); it != clientMap.end();) {
-					if (it->second->getDisconnectFlags() & DISCONNECT_COMPLETE) {
+					if (it->second->disconnectComplete()) {
 						fprintf(stderr, "%lld: Culled %s, have %lu relay clients\n", (long long) time(NULL), it->first.c_str(), clientMap.size() - 1);
 						delete it->second;
 						clientMap.erase(it++);
@@ -149,7 +145,7 @@ int main(int argc, char** argv) {
 				(host.length() > droppostfix.length() && !host.compare(host.length() - droppostfix.length(), droppostfix.length(), droppostfix))) {
 			if (clientMap.count(host)) {
 				const auto& client = clientMap[host];
-				fprintf(stderr, "%lld: Got duplicate connection from %s (original's disconnect status: %d)\n", (long long) time(NULL), host.c_str(), client->getDisconnectFlags());
+				fprintf(stderr, "%lld: Got duplicate connection from %s (original's disconnect status: %s)\n", (long long) time(NULL), host.c_str(), client->getDisconnectDebug().c_str());
 			}
 			close(new_fd);
 		} else {

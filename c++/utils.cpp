@@ -1,3 +1,4 @@
+#include "preinclude.h"
 #include "utils.h"
 #include "crypto/sha2.h"
 
@@ -53,24 +54,35 @@ uint64_t read_varint(std::vector<unsigned char>::const_iterator& it, const std::
 	}
 }
 
-std::vector<unsigned char> varint(uint32_t size) {
-	if (size < 0xfd) {
-		uint8_t lesize = size;
-		return std::vector<unsigned char>(&lesize, &lesize + sizeof(lesize));
+uint32_t varint_length(uint32_t num) {
+	if (num < 0xfd)
+		return 1;
+	else if (num < 0xffff)
+		return 3;
+	else if (num < 0xffffffff)
+		return 5;
+	else
+		return 9;
+}
+
+std::vector<unsigned char> varint(uint32_t num) {
+	if (num < 0xfd) {
+		uint8_t lenum = num;
+		return std::vector<unsigned char>(&lenum, &lenum + sizeof(lenum));
 	} else {
 		std::vector<unsigned char> res;
-		if (size <= 0xffff) {
+		if (num <= 0xffff) {
 			res.push_back(0xfd);
-			uint16_t lesize = htole16(size);
-			res.insert(res.end(), (unsigned char*)&lesize, ((unsigned char*)&lesize) + sizeof(lesize));
-		} else if (size <= 0xffffffff) {
+			uint16_t lenum = htole16(num);
+			res.insert(res.end(), (unsigned char*)&lenum, ((unsigned char*)&lenum) + sizeof(lenum));
+		} else if (num <= 0xffffffff) {
 			res.push_back(0xfe);
-			uint32_t lesize = htole32(size);
-			res.insert(res.end(), (unsigned char*)&lesize, ((unsigned char*)&lesize) + sizeof(lesize));
+			uint32_t lenum = htole32(num);
+			res.insert(res.end(), (unsigned char*)&lenum, ((unsigned char*)&lenum) + sizeof(lenum));
 		} else {
 			res.push_back(0xff);
-			uint64_t lesize = htole64(size);
-			res.insert(res.end(), (unsigned char*)&lesize, ((unsigned char*)&lesize) + sizeof(lesize));
+			uint64_t lenum = htole64(num);
+			res.insert(res.end(), (unsigned char*)&lenum, ((unsigned char*)&lenum) + sizeof(lenum));
 		}
 		return res;
 	}
@@ -126,6 +138,12 @@ std::string gethostname(struct sockaddr_in6 *addr) {
 		return res + std::string(hbuf);
 }
 
+#ifdef FOR_VALGRIND
+//getaddrinfo is detected by helgrind/drd as having a data race in it.
+//I haven't actually checked if this is the case, but the manpage says it doesn't, so lets just work around that :)
+static std::mutex getaddrinfo_mutex;
+#endif
+
 bool lookup_address(const char* addr, struct sockaddr_in6* res) {
 	struct addrinfo hints,*server = NULL;
 
@@ -138,7 +156,17 @@ bool lookup_address(const char* addr, struct sockaddr_in6* res) {
 	hints.ai_family = AF_INET6;
 #endif
 
-	int gaires = getaddrinfo(addr, NULL, &hints, &server);
+	int gaires
+#ifdef FOR_VALGRIND
+		;
+	{
+		std::lock_guard<std::mutex> lock(getaddrinfo_mutex);
+		gaires
+#endif
+		= getaddrinfo(addr, NULL, &hints, &server);
+#ifdef FOR_VALGRIND
+		}
+#endif
 	if (gaires) {
 		printf("Unable to lookup hostname: %d (%s)\n", gaires, gai_strerror(gaires));
 		if (server)
@@ -260,7 +288,7 @@ int create_connect_socket(const std::string& serverHost, const uint16_t serverPo
  *** Random stuff ***
  ********************/
 #ifdef SHA256
-extern "C" void SHA256(void *, uint32_t[8], uint64_t);
+extern "C" void SHA256(const void *, uint32_t[8], uint64_t);
 #endif
 
 void static inline WriteBE64(unsigned char *ptr, uint64_t x) {
@@ -302,19 +330,26 @@ void double_sha256(const unsigned char* input, unsigned char* res, uint64_t byte
 	hash.Finalize(res);
 	hash.Reset().Write(res, 32).Finalize(res);
 #else
-	uint64_t pad_count = 1 + ((119 - (byte_count % 64)) % 64);
-	std::vector<unsigned char> data(byte_count + pad_count + 8);
-
-	memcpy(&data[0], input, byte_count);
-	data[byte_count] = 0x80;
-	memset(&data[byte_count+1], 0, pad_count-1);
-	WriteBE64(&data[byte_count + pad_count], byte_count << 3);
-
 	uint32_t state[8];
 	sha256_init(state);
+	uint64_t bytes_read = byte_count / 64;
+	if (bytes_read)
+		SHA256(&input[0], state, bytes_read);
 
+	bytes_read *= 64;
+	uint64_t bytes_left = byte_count - bytes_read;
+
+	unsigned char data[128];
+
+	uint64_t pad_count = 1 + ((119 - bytes_left) % 64);
 	assert((byte_count + pad_count + 8) % 64 == 0);
-	SHA256(&data[0], state, (byte_count + pad_count + 8) / 64);
+
+	memcpy(&data[0], input + bytes_read, bytes_left);
+	data[bytes_left] = 0x80;
+	memset(&data[bytes_left + 1], 0, pad_count-1);
+	WriteBE64(&data[bytes_left + pad_count], byte_count << 3);
+
+	SHA256(&data[0], state, (bytes_left + pad_count + 8) / 64);
 	sha256_done(&data[0], state);
 
 	data[32] = 0x80;
@@ -369,18 +404,18 @@ void double_sha256_init(uint32_t state[8]) {
 
 void double_sha256_step(const unsigned char* input, uint64_t byte_count, uint32_t state[8]) {
 	assert(byte_count % 64 == 0);
-#ifndef SHA256
 	if (byte_count) {
+#ifndef SHA256
 		CSHA256 hash;
 		for (uint8_t i = 0; i < 8; i++)
 			hash.s[i] = state[i];
 		hash.Write(input, byte_count);
 		for (uint8_t i = 0; i < 8; i++)
 			state[i] = hash.s[i];
-	}
 #else
-	SHA256(const_cast<unsigned char*>(input), state, byte_count / 64);
+		SHA256(const_cast<unsigned char*>(input), state, byte_count / 64);
 #endif
+	}
 }
 
 void double_sha256_done(const unsigned char* input, uint64_t byte_count, uint64_t total_byte_count, uint32_t state[8]) {
@@ -420,9 +455,15 @@ void double_sha256_done(const unsigned char* input, uint64_t byte_count, uint64_
 #endif
 }
 
+void getblockhash(std::vector<unsigned char>& hashRes, const unsigned char* headerptr) {
+	assert(hashRes.size() == 32);
+	double_sha256(headerptr, &hashRes[0], 80);
+}
+
 void getblockhash(std::vector<unsigned char>& hashRes, const std::vector<unsigned char>& block, size_t offset) {
 	assert(hashRes.size() == 32);
-	return double_sha256(&block[offset], &hashRes[0], 80);
+	assert(block.size() >= offset + 80);
+	double_sha256(&block[offset], &hashRes[0], 80);
 }
 
 class not_hex : public std::exception {};
